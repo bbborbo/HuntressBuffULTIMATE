@@ -76,6 +76,7 @@ namespace SprintPerfected
                 $"<style=cStack>(+{Tools.ConvertDecimal(drinkSpeedBonusStack)} per stack)</style>.");
             RecalculateStatsAPI.GetStatCoefficients += (self, args) => // made to work with holydll
             {
+                if (self?.inventory == null) return;
                 int count = self.inventory.GetItemCount(RoR2Content.Items.SprintBonus);
                 if (count > 0 && self.isSprinting) args.moveSpeedMultAdd += ((drinkSpeedBonusStack - 0.25f) * (count - 1) + (drinkSpeedBonusBase - 0.25f)) / self.sprintingSpeedMultiplier;
             };
