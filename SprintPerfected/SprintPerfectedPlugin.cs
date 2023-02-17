@@ -1,6 +1,7 @@
 ﻿using BepInEx;
 using BepInEx.Configuration;
-using JetBrains.Annotations;
+using BepInEx.Logging;
+using Mono.Cecil.Cil;
 using MonoMod.Cil;
 using R2API;
 using R2API.Utils;
@@ -8,7 +9,7 @@ using RoR2;
 using RoR2.Skills;
 using System;
 using System.Collections.Generic;
-using System.Text;
+using System.Linq;
 using UnityEngine;
 
 namespace SprintPerfected
@@ -23,23 +24,20 @@ namespace SprintPerfected
     [R2APISubmoduleDependency(nameof(LanguageAPI))]
     public class SprintPerfectedPlugin : BaseUnityPlugin
     {
+        public static ManualLogSource Log;
+        internal static PluginInfo pluginInfo;
         public static ConfigFile CustomConfigFile { get; set; }
         public static ConfigEntry<bool> NerfSprint { get; set; }
         public static ConfigEntry<float> EnergyDrinkBase { get; set; }
         public static ConfigEntry<float> EnergyDrinkStack { get; set; }
+        public static ConfigEntry<string> AgileList { get; set; }
 
         public void Awake()
         {
+            pluginInfo = Info;
+            Log = Logger;
             InitializeConfig();
-
-            if (NerfSprint.Value)
-            {
-                SprintNerf();
-            }
-            else
-            {
-                SprintBuff();
-            }
+            Hooks();
         }
 
         private void InitializeConfig()
@@ -54,143 +52,89 @@ namespace SprintPerfected
                 "How much bonus speed Energy Drink should grant while sprinting, on the first stack. Vanilla is 25.");
             EnergyDrinkStack = CustomConfigFile.Bind<float>("Sprint Nerf", "Energy Drink STACK Speed Bonus", drinkSpeedBonusStack * 100,
                 "How much bonus speed Energy Drink should grant while sprinting, on every stack past the first. Vanilla is 25.");
+            AgileList = CustomConfigFile.Bind<string>("Sprint Nerf", "Agile List", "",
+                "List of skill names to make agile, separated by comma. Accepts nameTokens. if sprint buff is enabled, works as a blacklist instead.");
         }
-
-        #region sprint buff
-        void SprintBuff()
-        {
-            Debug.Log("You chose Sprint Buff! Based and shoepilled!");
-            On.RoR2.Skills.SkillCatalog.SetSkillDefs += MakeEverythingAgile;
-        }
-
-        private void MakeEverythingAgile(On.RoR2.Skills.SkillCatalog.orig_SetSkillDefs orig, SkillDef[] newSkillDefs)
-        {
-            for (int i = 0; i < newSkillDefs.Length; i++)
-            {
-                SkillDef skillDef = newSkillDefs[i];
-                if (skillDef != null && skillDef.canceledFromSprinting == false)
-                {
-                    bool b = false;
-                    if (skillDef.keywordTokens == null || skillDef.keywordTokens.Length == 0)
-                        b = true;
-
-                    if (!b)
-                    {
-                        foreach(string s in skillDef.keywordTokens)
-                            if(s == "KEYWORD_AGILE")
-                            {
-                                b = true;
-                                break;
-                            }
-                    }
-
-                    if (b)
-                    {
-                        string skillDescriptionToken = skillDef.skillDescriptionToken;
-                        string skillDescription = Language.GetString(skillDescriptionToken, "EN");
-                        if (skillDescriptionToken != skillDescription && !skillDescription.Contains("Agile"))
-                        {
-                            LanguageAPI.AddOverlay(skillDescriptionToken, "<style=cIsUtility>Agile</style>. " + skillDescription);
-                        }
-
-                        string keywordToken = "KEYWORD_AGILE";
-                        if (skillDef.keywordTokens == null || skillDef.keywordTokens.Length == 0)
-                        {
-                            skillDef.keywordTokens = new string[] { keywordToken };
-                        }
-                        else
-                        {
-                            HGArrayUtilities.ArrayAppend(ref skillDef.keywordTokens, ref keywordToken);
-                        }
-
-                        skillDef.cancelSprintingOnActivation = false;
-                    }
-                }
-            }
-            orig(newSkillDefs);
-        }
-        #endregion
-
-        #region sprint nerf
 
         public static float drinkSpeedBonusBase = 0.35f; //0.25
         public static float drinkSpeedBonusStack = 0.35f; //0.25
-        void SprintNerf()
+        void Hooks()
         {
-            Debug.Log("You chose Sprint Nerf! Based and shoepilled!");
-            On.RoR2.Skills.SkillDef.OnFixedUpdate += SkillDefFixedUpdate;
+            Log.LogDebug($"You chose Sprint {(NerfSprint.Value ? "Nerf" : "Buff")}! Based and shoepilled!");
+            On.RoR2.Skills.SkillCatalog.SetSkillDefs += MakeSomethingAgile;
+            if (NerfSprint.Value || AgileList.Value != "") IL.RoR2.Skills.SkillDef.OnFixedUpdate += SkillDefFixedUpdate; // if strictly buffed, no need to patch
 
             SkillDef acridPoisonSkill = Resources.Load<SkillDef>("skilldefs/crocobody/CrocoPassivePoison");
             SkillDef acridBlightSkill = Resources.Load<SkillDef>("skilldefs/crocobody/CrocoPassiveBlight");
             acridPoisonSkill.cancelSprintingOnActivation = false;
             acridBlightSkill.cancelSprintingOnActivation = false;
 
-
+            drinkSpeedBonusBase = EnergyDrinkBase.Value / 100f;
+            drinkSpeedBonusStack = EnergyDrinkStack.Value / 100f;
             LanguageAPI.Add("ITEM_SPRINTBONUS_DESC",
                 $"<style=cIsUtility>Sprint speed</style> is improved by <style=cIsUtility>{Tools.ConvertDecimal(drinkSpeedBonusBase)}</style> " +
                 $"<style=cStack>(+{Tools.ConvertDecimal(drinkSpeedBonusStack)} per stack)</style>.");
-
-            drinkSpeedBonusBase = EnergyDrinkBase.Value / 100;
-            drinkSpeedBonusStack = EnergyDrinkStack.Value / 100;
-            IL.RoR2.CharacterBody.RecalculateStats += DrinkBuff;
+            RecalculateStatsAPI.GetStatCoefficients += (self, args) => // made to work with holydll
+            {
+                int count = self.inventory.GetItemCount(RoR2Content.Items.SprintBonus);
+                if (count > 0 && self.isSprinting) args.moveSpeedMultAdd += ((drinkSpeedBonusStack - 0.25f) * (count - 1) + (drinkSpeedBonusBase - 0.25f)) / self.sprintingSpeedMultiplier;
+            };
         }
 
-        private void DrinkBuff(ILContext il)
+        private void SkillDefFixedUpdate(ILContext il) // this is the same on hook just now as an IL hook
         {
             ILCursor c = new ILCursor(il);
-
-            int countLoc = -1;
-            c.GotoNext(MoveType.After,
-                x => x.MatchLdsfld("RoR2.RoR2Content/Items", "SprintBonus"),
-                x => x.MatchCallOrCallvirt<RoR2.Inventory>(nameof(RoR2.Inventory.GetItemCount)),
-                x => x.MatchStloc(out countLoc)
-                );
-
-            c.GotoNext(MoveType.After,
-                x => x.MatchLdcR4(out _),
-                x => x.MatchLdloc(countLoc),
-                x => x.MatchConvR4()
-                );
-            c.EmitDelegate<Func<float, float, float>>((speedBonus, itemCount) =>
+            ILLabel end = null;
+            c.GotoNext(x => x.MatchRet());
+            c.GotoPrev(x => x.MatchBrfalse(out end)); // IL_0073
+            c.Index = 0;
+            c.GotoNext(MoveType.AfterLabel, x => x.MatchBrfalse(out _), x => x.MatchLdarg(1)); // IL_0029
+            c.Emit(OpCodes.Pop).Emit(OpCodes.Ldc_I4_1); // idk whats going on before this point but sotp, keep `skillSlot.stateMachine.state?.GetType() != self.activationState.stateType`
+            c.GotoNext(MoveType.After, x => x.MatchCallOrCallvirt<EntityStateMachine>(nameof(EntityStateMachine.SetNextStateToMain)));
+            c.Emit(OpCodes.Br, end); // ends after main set
+            c.GotoNext(x => x.MatchBrfalse(end)); // hey remember IL_0073
+            c.Emit(OpCodes.Ldarg_0);
+            c.EmitDelegate<Func<bool, SkillDef, bool>>((orig, self) => orig || self.cancelSprintingOnActivation); // brfalse so both needs to be false
+            c.GotoNext(x => x.MatchCallOrCallvirt<CharacterBody>("set_" + nameof(CharacterBody.isSprinting)));
+            c.Emit(OpCodes.Pop).Emit(OpCodes.Ldarg_0);
+            c.EmitDelegate<Func<SkillDef, bool>>(self =>
             {
-                float newSpeedBonus = 0;
-                if (itemCount > 0)
-                {
-                    newSpeedBonus = drinkSpeedBonusBase + (drinkSpeedBonusStack * (itemCount - 1));
-                }
-                return newSpeedBonus;
+                if (self.forceSprintDuringState) return true;
+                if (self.cancelSprintingOnActivation) return false;
+                Log.LogDebug("?? Something went wrong");
+                return false;
             });
-            c.Remove();
         }
 
-        private void SkillDefFixedUpdate(On.RoR2.Skills.SkillDef.orig_OnFixedUpdate orig, RoR2.Skills.SkillDef self, [NotNull] GenericSkill skillSlot)
+        private void MakeSomethingAgile(On.RoR2.Skills.SkillCatalog.orig_SetSkillDefs orig, SkillDef[] newSkillDefs)
         {
-            if (skillSlot.stateMachine == null)
+            List<string> list = AgileList.Value.Split(',').ToList().ConvertAll(x => x.Trim());
+            string txt = "Skills List: ";
+            for (int i = 0; i < newSkillDefs.Length; i++)
             {
-                orig(self, skillSlot);
-                return;
-            }
+                SkillDef skillDef = newSkillDefs[i];
+                if (skillDef?.skillNameToken != null && skillDef.skillNameToken.Trim().Length > 0) // null check
+                {
+                    txt += $"{(i > 0 ? ", " : "")}'{skillDef.skillNameToken}'";
+                    if ((NerfSprint.Value ? list.Contains(skillDef.skillNameToken) : !list.Contains(skillDef.skillNameToken)) // list check
+                        && !skillDef.canceledFromSprinting // already agile (not canceled from sprinting)
+                        && (skillDef.keywordTokens == null || skillDef.keywordTokens.Length == 0 || skillDef.keywordTokens.Any(x => x == "KEYWORD_AGILE"))) // already agile... somehow
+                    {
+                        string skillDescriptionToken = skillDef.skillDescriptionToken;
+                        string skillDescription = Language.GetString(skillDescriptionToken, "EN");
+                        if (skillDescriptionToken != skillDescription && !skillDescription.Contains("Agile"))
+                            LanguageAPI.AddOverlay(skillDescriptionToken, "<style=cIsUtility>Agile</style>. " + skillDescription);
 
-            skillSlot.RunRecharge(Time.fixedDeltaTime);
-            if (skillSlot.stateMachine.state?.GetType() == self.activationState.stateType)
-            {
-                if (self.canceledFromSprinting && skillSlot.characterBody.isSprinting)
-                {
-                    skillSlot.stateMachine.SetNextStateToMain();
-                }
-                else
-                {
-                    if (self.forceSprintDuringState)
-                    {
-                        skillSlot.characterBody.isSprinting = true;
-                    }
-                    else if (self.cancelSprintingOnActivation)
-                    {
-                        skillSlot.characterBody.isSprinting = false;
+                        string keywordToken = "KEYWORD_AGILE";
+                        if (skillDef.keywordTokens == null || skillDef.keywordTokens.Length == 0)
+                            skillDef.keywordTokens = new string[] { keywordToken };
+                        else HGArrayUtilities.ArrayAppend(ref skillDef.keywordTokens, ref keywordToken);
+                        skillDef.cancelSprintingOnActivation = false;
                     }
                 }
             }
+            Log.LogInfo(txt);
+            orig(newSkillDefs);
         }
-        #endregion
     }
 }
